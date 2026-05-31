@@ -41,4 +41,4 @@ secrets/
 watchtower-frontend.zip
 package-lock.json
 db_data
-watchtower
+watchtower-cli/watchtower
