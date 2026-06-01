@@ -32,9 +32,9 @@ def run_httpx_bulk(subdomains, domain):
         "-tech-detect",
         "-status-code",
         "-title",
-        "-threads", "50",
+        "-threads", "30",
         "-timeout", "5",
-        "-retries", "2"
+        "-retries", "1"
     ]
     
     print(f"{colors.Gray}[{current_time()}] Executing httpx bulk for {len(subdomains)} subdomains...{colors.Reset}")

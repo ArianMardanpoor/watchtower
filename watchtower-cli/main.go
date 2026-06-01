@@ -76,12 +76,16 @@ func c(color, text string) string {
 
 // ─── Data Structures ─────────────────────────────────────────────────────────
 
-type SubdomainResponse struct {
+type GenericResponse struct {
 	Total   int      `json:"total"`
 	Page    int      `json:"page"`
 	PerPage int      `json:"per_page"`
 	Data    []string `json:"data"`
 }
+
+type SubdomainResponse GenericResponse
+type LiveResponse GenericResponse
+type HTTPResponse GenericResponse
 
 type Program struct {
 	Scopes      []string          `json:"scopes"`
@@ -90,20 +94,6 @@ type Program struct {
 	CreatedDate string            `json:"created_date"`
 }
 type ProgramResponse map[string]Program
-
-type LiveResponse struct {
-	Total   int      `json:"total"`
-	Page    int      `json:"page"`
-	PerPage int      `json:"per_page"`
-	Data    []string `json:"data"`
-}
-
-type HTTPResponse struct {
-	Total   int      `json:"total"`
-	Page    int      `json:"page"`
-	PerPage int      `json:"per_page"`
-	Data    []string `json:"data"`
-}
 
 // ─── HTTP Client ─────────────────────────────────────────────────────────────
 
@@ -139,8 +129,8 @@ func makeRequest(endpoint string, result interface{}) error {
 	return json.NewDecoder(resp.Body).Decode(result)
 }
 
-// fetchAllPages fetches all pages for a paginated endpoint and returns all items.
-func fetchAllPages(endpoint string) ([]string, int, error) {
+// fetchAllPagesGeneric fetches all pages for any paginated endpoint and returns all items.
+func fetchAllPagesGeneric(endpoint string) ([]string, int, error) {
 	var all []string
 	page := 1
 	perPage := 200
@@ -153,7 +143,7 @@ func fetchAllPages(endpoint string) ([]string, int, error) {
 		}
 		fullEndpoint := fmt.Sprintf("%s%spage=%d&per_page=%d", endpoint, sep, page, perPage)
 
-		var res SubdomainResponse
+		var res GenericResponse
 		if err := makeRequest(fullEndpoint, &res); err != nil {
 			return nil, 0, err
 		}
@@ -238,7 +228,6 @@ func printUsage() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	// Global flags before subcommand
 	args := os.Args[1:]
 	filtered := args[:0]
 	for i := 0; i < len(args); i++ {
@@ -381,16 +370,16 @@ func showStats() {
 
 	var http HTTPResponse
 	if err := makeRequest("/http/all?page=1&per_page=1", &http); err == nil {
-		stats = append(stats, stat{"Web Services (12h)", fmt.Sprintf("%d", http.Total), Cyan})
+		stats = append(stats, stat{"Web Services", fmt.Sprintf("%d", http.Total), Cyan})
 	}
 
 	var freshLive LiveResponse
-	if err := makeRequest("/live/fresh", &freshLive); err == nil {
+	if err := makeRequest("/live/fresh?page=1&per_page=1", &freshLive); err == nil {
 		stats = append(stats, stat{"New Live (12h)", fmt.Sprintf("%d", freshLive.Total), Blue})
 	}
 
 	var freshHTTP HTTPResponse
-	if err := makeRequest("/http/fresh", &freshHTTP); err == nil {
+	if err := makeRequest("/http/fresh?page=1&per_page=1", &freshHTTP); err == nil {
 		stats = append(stats, stat{"New HTTP (12h)", fmt.Sprintf("%d", freshHTTP.Total), Blue})
 	}
 
@@ -436,7 +425,6 @@ func handlePrograms() {
 			return
 		}
 
-		// Sort program names
 		names := make([]string, 0, len(programs))
 		for name := range programs {
 			names = append(names, name)
@@ -478,7 +466,6 @@ func handlePrograms() {
 
 		prog, exists := programs[*progName]
 		if !exists {
-			// Fuzzy suggest
 			fmt.Printf("%s[✗] Program '%s' not found.%s\n", Red, *progName, Reset)
 			fmt.Println(c(DimWhite, "\nDid you mean one of these?"))
 			for name := range programs {
@@ -534,9 +521,8 @@ func handleSubdomains() {
 		_ = allCmd.Parse(os.Args[3:])
 
 		if *page == 0 {
-			// Fetch ALL pages
 			spinner("Fetching all subdomains")
-			items, total, err := fetchAllPages("/subdomains/all")
+			items, total, err := fetchAllPagesGeneric("/subdomains/all")
 			clearLine()
 			if err != nil {
 				fmt.Printf("%s[✗] %v%s\n", Red, err, Reset)
@@ -574,7 +560,7 @@ func handleSubdomains() {
 
 		if *all {
 			spinner("Fetching all subdomains for " + *domain)
-			items, total, err := fetchAllPages(endpoint)
+			items, total, err := fetchAllPagesGeneric(endpoint)
 			clearLine()
 			if err != nil {
 				fmt.Printf("%s[✗] %v%s\n", Red, err, Reset)
@@ -611,7 +597,7 @@ func handleSubdomains() {
 		}
 
 		spinner("Fetching all subdomains to search")
-		items, total, err := fetchAllPages("/subdomains/all")
+		items, total, err := fetchAllPagesGeneric("/subdomains/all")
 		clearLine()
 		if err != nil {
 			fmt.Printf("%s[✗] %v%s\n", Red, err, Reset)
@@ -629,7 +615,6 @@ func handleSubdomains() {
 		fmt.Printf("\n%s🔍 Search: \"%s\"%s — %s%d matches%s of %d total\n\n",
 			Cyan, *query, Reset, Yellow, len(matches), Reset, total)
 		for _, sd := range matches {
-			// Highlight the match
 			idx := strings.Index(strings.ToLower(sd), q)
 			if idx >= 0 && !noColor {
 				highlighted := sd[:idx] + Red + sd[idx:idx+len(*query)] + Reset + sd[idx+len(*query):]
@@ -666,14 +651,17 @@ func handleLive() {
 		label = "FRESH (last 12h)"
 	}
 
-	var res LiveResponse
-	if err := makeRequest(endpoint, &res); err != nil {
+	// اصلاح پجینیشن برای لود کردن کامل دارایی‌های Live
+	spinner("Fetching live assets")
+	items, total, err := fetchAllPagesGeneric(endpoint)
+	clearLine()
+	if err != nil {
 		fmt.Printf("%s[✗] %v%s\n", Red, err, Reset)
 		return
 	}
 
-	fmt.Printf("\n%s✅ Live Assets [%s]%s — %s%d total%s\n\n", Green, label, Reset, Yellow, res.Total, Reset)
-	for _, host := range res.Data {
+	fmt.Printf("\n%s✅ Live Assets [%s]%s — %s%d total%s\n\n", Green, label, Reset, Yellow, total, Reset)
+	for _, host := range items {
 		fmt.Fprintf(writer, "  %s %s\n", c(DimGreen, "▸"), host)
 	}
 }
@@ -695,15 +683,17 @@ func handleHTTP() {
 		label = "FRESH (last 12h)"
 	}
 
-	var res HTTPResponse
-	if err := makeRequest(endpoint, &res); err != nil {
+	// اصلاح پجینیشن برای لود کردن کامل تمام وب‌سرویس‌ها
+	spinner("Fetching web services")
+	items, total, err := fetchAllPagesGeneric(endpoint)
+	clearLine()
+	if err != nil {
 		fmt.Printf("%s[✗] %v%s\n", Red, err, Reset)
 		return
 	}
 
-	fmt.Printf("\n%s🌐 Web Services [%s]%s — %s%d total%s\n\n", Cyan, label, Reset, Yellow, res.Total, Reset)
-
-	for _, url := range res.Data {
+	fmt.Printf("\n%s🌐 Web Services [%s]%s — %s%d total%s\n\n", Cyan, label, Reset, Yellow, total, Reset)
+	for _, url := range items {
 		fmt.Fprintf(writer, "%s\n", url)
 	}
 }
@@ -744,7 +734,6 @@ func handleExport() {
 	_ = exportCmd.Parse(os.Args[3:])
 
 	if *output == "" {
-		// Auto-generate filename
 		*output = fmt.Sprintf("watchtower_%s_%s.txt", target, time.Now().Format("20060102_150405"))
 		fmt.Printf("%s[~] No --output given, using: %s%s\n", DimCyan, *output, Reset)
 	}
@@ -759,7 +748,7 @@ func handleExport() {
 	switch target {
 	case "subdomains":
 		spinner("Fetching all subdomains")
-		items, total, err := fetchAllPages("/subdomains/all")
+		items, total, err := fetchAllPagesGeneric("/subdomains/all")
 		clearLine()
 		if err != nil {
 			fmt.Printf("%s[✗] %v%s\n", Red, err, Reset)
@@ -834,7 +823,6 @@ func interactiveMode() {
 		case "clear", "cls":
 			clearScreen()
 		default:
-			// Reconstruct and dispatch
 			os.Args = append([]string{"watchtower"}, parts...)
 			command := parts[0]
 			switch command {

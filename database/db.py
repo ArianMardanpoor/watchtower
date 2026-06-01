@@ -2,6 +2,12 @@ from mongoengine import Document, StringField, DateTimeField, ListField, DictFie
 from pymongo import UpdateOne  # اضافه شده برای عملیات گروهی و پرسرعت
 from datetime import datetime
 import tldextract
+import os
+import sys
+
+# ایمپورت notify با مسیر نسبی
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from utils.notify import queue_new_http, queue_http_change
 
 def current_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -286,8 +292,12 @@ def upsert_http(obj):
             existing.favicon = obj.get('favicon')
         
         if changes:
-            # TODO: ارسال اعلان به تلگرام
             print(f"[{current_time()}] Changes detected for {obj.get('subdomain')}: {', '.join(changes)}")
+            queue_http_change(
+                program_name=existing.program_name,
+                url=obj.get('url') or obj.get('subdomain'),
+                changes=changes,
+            )
         
         existing.ips = obj.get('ips', [])
         existing.tech = obj.get('tech', [])
@@ -314,5 +324,14 @@ def upsert_http(obj):
         )
         new_http.save()
         print(f"[{current_time()}] Inserted new HTTP service: {obj.get('subdomain')}")
+
+        queue_new_http(
+            program_name=program.program_name,
+            url=obj.get('url') or obj.get('subdomain'),
+            status_code=obj.get('status_code', 0),
+            title=obj.get('title', ''),
+            tech=obj.get('tech', []),
+            ips=obj.get('ips', []),
+        )
     
     return True

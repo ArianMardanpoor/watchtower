@@ -7,6 +7,7 @@ import tempfile
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from database.db import Programs, LiveSubdomains, upsert_http, current_time
 from utils.safe_subprocess import run_command_safe
+from utils.notify import flush_all
 
 if __name__ == "__main__":
     programs = Programs.objects.all()
@@ -23,12 +24,21 @@ if __name__ == "__main__":
                     temp_file_path = temp_file.name
 
                 command = [
-                    "httpx", "-l", temp_file_path, "-silent", "-json", "-favicon",
-                    "-tech-detect", "-status-code", "-title", "-threads", "50",
-                    "-timeout", "5", "-retries", "2"
+                    "httpx", 
+                    "-l", temp_file.name, 
+                    "-silent", 
+                    "-json", 
+                    "-favicon", 
+                    "-tech-detect", 
+                    "-status-code", 
+                    "-title", 
+                    "-threads", "30", 
+                    "-timeout", "5", 
+                    "-retries", "1"
                 ]
 
-                results = run_command_safe(command)
+                results = run_command_safe(command, timeout=300)
+
                 if results:
                     for line in results:
                         if not line.strip(): continue
@@ -55,3 +65,6 @@ if __name__ == "__main__":
                     pass
             else:
                 print(f"[{current_time()}] No live subdomains for scope: {scope}")
+
+    # ارسال تمام نوتیف‌های بافرشده در پایان اسکن
+    flush_all()
