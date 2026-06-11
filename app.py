@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+Watchtower API - Full-Featured Recon Dashboard Backend
+Supports rich multi-field filtering across all asset types
+"""
 import os
 import re
 from flask import Flask, request, jsonify
@@ -6,6 +10,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 import signal
 import sys
+from mongoengine.queryset.visitor import Q
 from database.db import (
     Programs, Subdomains, LiveSubdomains, Http,
     current_time
@@ -13,15 +18,14 @@ from database.db import (
 
 app = Flask(__name__)
 
-# خواندن توکن احراز هویت از متغیرهای محیطی سیستم با یک مقدار پیش‌فرض امن
 API_TOKEN = os.getenv("WATCHTOWER_API_TOKEN", "a21uc0lzeTcK")
 
 
+# ==========================================
+# Auth & Helpers
+# ==========================================
+
 def require_auth(f):
-    """
-    دکوراتور پیشرفته برای بررسی وجود و صحت API Token در هدر درخواست‌ها.
-    استفاده از @wraps الزامی است تا فلسک نام توابع اصلی را گم نکند.
-    """
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get('X-API-Token')
@@ -32,7 +36,6 @@ def require_auth(f):
 
 
 def validate_domain(domain: str) -> bool:
-    """اعتبارسنجی فرمت نام دامنه ریشه برای جلوگیری از ورودی‌های مخرب"""
     if not domain or len(domain) > 253:
         return False
     pattern = r'^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}[a-zA-Z0-9]$'
@@ -40,160 +43,917 @@ def validate_domain(domain: str) -> bool:
 
 
 def get_pagination_args():
-    """استخراج پارامترهای صفحه‌بندی از URL"""
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 100, type=int)
+    per_page = min(request.args.get('per_page', 100, type=int), 1000)
     return page, per_page
 
 
-# ----------------------------------------------------------------------
-# 🎯 روت‌های API سیستم واچ‌تاور
-# ----------------------------------------------------------------------
+def parse_date(date_str):
+    """تبدیل رشته تاریخ به datetime - فرمت: YYYY-MM-DD یا YYYY-MM-DDTHH:MM:SS"""
+    if not date_str:
+        return None
+    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def paginate_response(query, page, per_page, serializer):
+    total = query.count()
+    objects = query.skip((page - 1) * per_page).limit(per_page)
+    return {
+        'total': total,
+        'page': page,
+        'per_page': per_page,
+        'pages': (total + per_page - 1) // per_page,
+        'data': [serializer(obj) for obj in objects]
+    }
+
+
+# ==========================================
+# Serializers
+# ==========================================
+
+def serialize_program(p):
+    return {
+        'program_name': p.program_name,
+        'scopes': p.scopes,
+        'outofscopes': p.outofscopes,
+        'config': p.config or {},
+        'created_date': p.created_date.strftime('%Y-%m-%d %H:%M:%S') if p.created_date else None
+    }
+
+
+def serialize_subdomain(sd):
+    return {
+        'subdomain': sd.subdomain,
+        'program_name': sd.program_name,
+        'scope': sd.scope,
+        'providers': sd.providers,
+        'created_date': sd.created_date.strftime('%Y-%m-%d %H:%M:%S') if sd.created_date else None,
+        'last_update': sd.last_update.strftime('%Y-%m-%d %H:%M:%S') if sd.last_update else None
+    }
+
+
+def serialize_live(l):
+    return {
+        'subdomain': l.subdomain,
+        'program_name': l.program_name,
+        'scope': l.scope,
+        'ips': l.ips,
+        'cdn': l.cdn,
+        'created_date': l.created_date.strftime('%Y-%m-%d %H:%M:%S') if l.created_date else None,
+        'last_update': l.last_update.strftime('%Y-%m-%d %H:%M:%S') if l.last_update else None
+    }
+
+
+def serialize_http(h, providers=None):
+    return {
+        'subdomain': h.subdomain,
+        'program_name': h.program_name,
+        'scope': h.scope,
+        'url': h.url,
+        'final_url': h.final_url,
+        'title': h.title,
+        'status_code': h.status_code,
+        'tech': h.tech,
+        'ips': h.ips,
+        'headers': h.headers,
+        'favicon': h.favicon,
+        'providers': providers or [],
+        'created_date': h.created_date.strftime('%Y-%m-%d %H:%M:%S') if h.created_date else None,
+        'last_update': h.last_update.strftime('%Y-%m-%d %H:%M:%S') if h.last_update else None
+    }
+
+
+# ==========================================
+# Health
+# ==========================================
 
 @app.route('/api/health')
 def health():
-    """بررسی وضعیت زنده بودن سرور API (مورد استفاده در دستور health ابزار Go)"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     })
 
 
-@app.route('/api/programs/all')
+# ==========================================
+# Programs
+# ==========================================
+
+@app.route('/api/programs', methods=['GET'])
 @require_auth
-def all_programs():
-    """لیست کردن تمام برنامه‌های ثبت شده به همراه جزئیات اسکوپ"""
+def get_programs():
+    """
+    لیست برنامه‌ها با فیلتر
+    Params:
+      - search: جستجو در نام برنامه
+    """
     programs = Programs.objects()
-    res = {}
-    for p in programs:
-        res[p.program_name] = {
-            "scopes": getattr(p, 'scopes', []),
-            "outofscopes": getattr(p, 'outofscopes', []),
-            "config": getattr(p, 'config_data', {}),
-            "created_date": p.created_date.strftime("%Y-%m-%d %H:%M:%S") if hasattr(p, 'created_date') and p.created_date else str(datetime.now())
+    search = request.args.get('search', '').strip()
+    if search:
+        programs = programs.filter(program_name__icontains=search)
+
+    return jsonify({
+        'total': programs.count(),
+        'data': [serialize_program(p) for p in programs]
+    })
+
+
+@app.route('/api/programs/<program_name>', methods=['GET'])
+@require_auth
+def get_program(program_name):
+    """جزئیات یک برنامه به همراه آمار کلی"""
+    program = Programs.objects(program_name=program_name).first()
+    if not program:
+        return jsonify({'error': 'Program not found'}), 404
+
+    stats = {
+        'subdomains': Subdomains.objects(program_name=program_name).count(),
+        'live': LiveSubdomains.objects(program_name=program_name).count(),
+        'http': Http.objects(program_name=program_name).count(),
+    }
+    data = serialize_program(program)
+    data['stats'] = stats
+    return jsonify(data)
+
+
+# ==========================================
+# Subdomains — Rich Filtering
+# ==========================================
+
+@app.route('/api/subdomains', methods=['GET'])
+@require_auth
+def get_subdomains():
+    """
+    دریافت ساب‌دامین‌ها با فیلترهای پیشرفته.
+
+    Query Params:
+      - program       : نام برنامه (مستقیم)
+      - programs      : چند برنامه جدا با کاما  (program1,program2)
+      - scope         : دامنه اصلی (مثلاً example.com)
+      - provider      : نام پروایدر (subfinder, amass, ...)
+      - providers     : چند پروایدر جدا با کاما
+      - search        : جستجو در نام ساب‌دامین (contains)
+      - has_http      : true/false — آیا ساب‌دامین در جدول http هست؟
+      - has_live      : true/false — آیا ساب‌دامین در جدول live_subdomains هست؟
+      - created_after : YYYY-MM-DD
+      - created_before: YYYY-MM-DD
+      - updated_after : YYYY-MM-DD
+      - updated_before: YYYY-MM-DD
+      - only_new      : true — ساب‌دامین‌های ۲۴ ساعت اخیر
+      - sort          : created_date / last_update / subdomain (پیشفرض: -created_date)
+      - page, per_page
+    """
+    page, per_page = get_pagination_args()
+    q = Subdomains.objects()
+
+    # فیلتر برنامه
+    program = request.args.get('program', '').strip()
+    programs_csv = request.args.get('programs', '').strip()
+    if program:
+        q = q.filter(program_name=program)
+    elif programs_csv:
+        prog_list = [p.strip() for p in programs_csv.split(',') if p.strip()]
+        q = q.filter(program_name__in=prog_list)
+
+    # فیلتر scope
+    scope = request.args.get('scope', '').strip()
+    if scope:
+        q = q.filter(scope=scope)
+
+    # فیلتر provider
+    provider = request.args.get('provider', '').strip()
+    providers_csv = request.args.get('providers', '').strip()
+    if provider:
+        q = q.filter(providers=provider)
+    elif providers_csv:
+        prov_list = [p.strip() for p in providers_csv.split(',') if p.strip()]
+        # ساب‌دامین‌هایی که حداقل یکی از این providerها رو دارن
+        q = q.filter(providers__in=prov_list)
+
+    # جستجو در نام
+    search = request.args.get('search', '').strip()
+    if search:
+        q = q.filter(subdomain__icontains=search)
+
+    # فیلتر تاریخ ایجاد
+    created_after = parse_date(request.args.get('created_after', ''))
+    if created_after:
+        q = q.filter(created_date__gte=created_after)
+    created_before = parse_date(request.args.get('created_before', ''))
+    if created_before:
+        q = q.filter(created_date__lte=created_before)
+
+    # فیلتر تاریخ آپدیت
+    updated_after = parse_date(request.args.get('updated_after', ''))
+    if updated_after:
+        q = q.filter(last_update__gte=updated_after)
+    updated_before = parse_date(request.args.get('updated_before', ''))
+    if updated_before:
+        q = q.filter(last_update__lte=updated_before)
+
+    # only_new: ۲۴ ساعت اخیر
+    if request.args.get('only_new', '').lower() == 'true':
+        q = q.filter(created_date__gte=datetime.now() - timedelta(hours=24))
+
+    # فیلتر has_live / has_http — از طریق join روی subdomain
+    has_live = request.args.get('has_live', '').lower()
+    if has_live in ('true', 'false'):
+        live_subs = set(LiveSubdomains.objects().distinct('subdomain'))
+        if has_live == 'true':
+            q = q.filter(subdomain__in=live_subs)
+        else:
+            q = q.filter(subdomain__nin=live_subs)
+
+    has_http = request.args.get('has_http', '').lower()
+    if has_http in ('true', 'false'):
+        http_subs = set(Http.objects().distinct('subdomain'))
+        if has_http == 'true':
+            q = q.filter(subdomain__in=http_subs)
+        else:
+            q = q.filter(subdomain__nin=http_subs)
+
+    # مرتب‌سازی
+    sort_map = {
+        'created_date': '+created_date',
+        '-created_date': '-created_date',
+        'last_update': '+last_update',
+        '-last_update': '-last_update',
+        'subdomain': '+subdomain',
+        '-subdomain': '-subdomain',
+    }
+    sort = request.args.get('sort', '-created_date')
+    order = sort_map.get(sort, '-created_date')
+    q = q.order_by(order)
+
+    return jsonify(paginate_response(q, page, per_page, serialize_subdomain))
+
+
+# ==========================================
+# Live Subdomains — Rich Filtering
+# ==========================================
+
+@app.route('/api/lives', methods=['GET'])
+@require_auth
+def get_lives():
+    """
+    دریافت ساب‌دامین‌های زنده با فیلترهای پیشرفته.
+
+    Query Params:
+      - program       : نام برنامه
+      - programs      : چند برنامه با کاما
+      - scope         : دامنه اصلی
+      - search        : جستجو در subdomain
+      - ip            : فیلتر بر اساس یک IP خاص
+      - has_cdn       : true/false — آیا CDN دارد؟
+      - cdn           : نام CDN خاص (مثلاً cloudflare)
+      - has_http      : true/false — آیا HTTP سرویس دارد؟
+      - created_after, created_before
+      - updated_after, updated_before
+      - only_new      : true — ۲۴ ساعت اخیر
+      - sort          : created_date / last_update / subdomain
+      - page, per_page
+    """
+    page, per_page = get_pagination_args()
+    q = LiveSubdomains.objects()
+
+    program = request.args.get('program', '').strip()
+    programs_csv = request.args.get('programs', '').strip()
+    if program:
+        q = q.filter(program_name=program)
+    elif programs_csv:
+        q = q.filter(program_name__in=[p.strip() for p in programs_csv.split(',') if p.strip()])
+
+    scope = request.args.get('scope', '').strip()
+    if scope:
+        q = q.filter(scope=scope)
+
+    search = request.args.get('search', '').strip()
+    if search:
+        q = q.filter(subdomain__icontains=search)
+
+    ip = request.args.get('ip', '').strip()
+    if ip:
+        q = q.filter(ips=ip)
+
+    has_cdn = request.args.get('has_cdn', '').lower()
+    if has_cdn == 'true':
+        q = q.filter(cdn__ne='').filter(cdn__exists=True)
+    elif has_cdn == 'false':
+        q = q.filter(Q(cdn='') | Q(cdn__exists=False))
+
+    cdn = request.args.get('cdn', '').strip()
+    if cdn:
+        q = q.filter(cdn__icontains=cdn)
+
+    created_after = parse_date(request.args.get('created_after', ''))
+    if created_after:
+        q = q.filter(created_date__gte=created_after)
+    created_before = parse_date(request.args.get('created_before', ''))
+    if created_before:
+        q = q.filter(created_date__lte=created_before)
+
+    updated_after = parse_date(request.args.get('updated_after', ''))
+    if updated_after:
+        q = q.filter(last_update__gte=updated_after)
+    updated_before = parse_date(request.args.get('updated_before', ''))
+    if updated_before:
+        q = q.filter(last_update__lte=updated_before)
+
+    if request.args.get('only_new', '').lower() == 'true':
+        q = q.filter(created_date__gte=datetime.now() - timedelta(hours=24))
+
+    has_http = request.args.get('has_http', '').lower()
+    if has_http in ('true', 'false'):
+        http_subs = set(Http.objects().distinct('subdomain'))
+        if has_http == 'true':
+            q = q.filter(subdomain__in=http_subs)
+        else:
+            q = q.filter(subdomain__nin=http_subs)
+
+    sort_map = {
+        'created_date': '+created_date', '-created_date': '-created_date',
+        'last_update': '+last_update', '-last_update': '-last_update',
+        'subdomain': '+subdomain', '-subdomain': '-subdomain',
+    }
+    order = sort_map.get(request.args.get('sort', '-created_date'), '-created_date')
+    q = q.order_by(order)
+
+    return jsonify(paginate_response(q, page, per_page, serialize_live))
+
+
+# ==========================================
+# HTTP Services — Rich Filtering
+# ==========================================
+
+@app.route('/api/http', methods=['GET'])
+@require_auth
+def get_http():
+    """
+    دریافت HTTP سرویس‌ها با فیلترهای پیشرفته.
+
+    Query Params:
+      - program        : نام برنامه
+      - programs       : چند برنامه با کاما
+      - scope          : دامنه اصلی
+      - search         : جستجو در url/subdomain/title
+      - status_code    : کد وضعیت دقیق (200)
+      - status_codes   : چند کد با کاما (200,301,403)
+      - status_range   : محدوده کد (200-299)
+      - tech           : نام تکنولوژی خاص (nginx, wordpress, ...)
+      - techs          : چند تکنولوژی با کاما
+      - title          : جستجو در title
+      - ip             : فیلتر بر اساس IP
+      - has_favicon    : true/false
+      - has_tech       : true/false — آیا تکنولوژی شناسایی شده؟
+      - header_key     : بررسی وجود یک header خاص (X-Powered-By)
+      - header_value   : مقدار header (با header_key ترکیب می‌شود)
+      - created_after, created_before
+      - updated_after, updated_before
+      - only_new       : true — ۲۴ ساعت اخیر
+      - only_changed   : true — آپدیت شده در ۲۴ ساعت اخیر
+      - sort           : created_date / last_update / status_code / title
+      - page, per_page
+    """
+    page, per_page = get_pagination_args()
+    q = Http.objects()
+
+    program = request.args.get('program', '').strip()
+    programs_csv = request.args.get('programs', '').strip()
+    if program:
+        q = q.filter(program_name=program)
+    elif programs_csv:
+        q = q.filter(program_name__in=[p.strip() for p in programs_csv.split(',') if p.strip()])
+
+    scope = request.args.get('scope', '').strip()
+    if scope:
+        q = q.filter(scope=scope)
+
+    # جستجوی عمومی در url، title و subdomain
+    search = request.args.get('search', '').strip()
+    if search:
+        q = q.filter(
+            Q(subdomain__icontains=search) |
+            Q(url__icontains=search) |
+            Q(title__icontains=search)
+        )
+
+    # فیلتر status code
+    status_code = request.args.get('status_code', type=int)
+    if status_code:
+        q = q.filter(status_code=status_code)
+    else:
+        status_codes_csv = request.args.get('status_codes', '').strip()
+        if status_codes_csv:
+            codes = [int(c.strip()) for c in status_codes_csv.split(',') if c.strip().isdigit()]
+            q = q.filter(status_code__in=codes)
+
+    status_range = request.args.get('status_range', '').strip()
+    if status_range and '-' in status_range:
+        parts = status_range.split('-')
+        try:
+            low, high = int(parts[0]), int(parts[1])
+            q = q.filter(status_code__gte=low, status_code__lte=high)
+        except (ValueError, IndexError):
+            pass
+
+    # فیلتر تکنولوژی
+    tech = request.args.get('tech', '').strip()
+    if tech:
+        q = q.filter(tech__icontains=tech)
+    techs_csv = request.args.get('techs', '').strip()
+    if techs_csv and not tech:
+        tech_list = [t.strip() for t in techs_csv.split(',') if t.strip()]
+        q = q.filter(tech__in=tech_list)
+
+    has_tech = request.args.get('has_tech', '').lower()
+    if has_tech == 'true':
+        q = q.filter(tech__ne=[]).filter(tech__exists=True)
+    elif has_tech == 'false':
+        q = q.filter(Q(tech=[]) | Q(tech__exists=False))
+
+    # جستجو در title
+    title = request.args.get('title', '').strip()
+    if title:
+        q = q.filter(title__icontains=title)
+
+    # فیلتر IP
+    ip = request.args.get('ip', '').strip()
+    if ip:
+        q = q.filter(ips=ip)
+
+    # فیلتر provider
+    provider = request.args.get('provider', '').strip()
+    if provider:
+        http_subdomains = set(Subdomains.objects(providers=provider).distinct('subdomain'))
+        q = q.filter(subdomain__in=http_subdomains)
+
+    # فیلتر favicon
+    has_favicon = request.args.get('has_favicon', '').lower()
+    if has_favicon == 'true':
+        q = q.filter(favicon__ne='').filter(favicon__exists=True)
+    elif has_favicon == 'false':
+        q = q.filter(Q(favicon='') | Q(favicon__exists=False))
+
+    # فیلتر header
+    header_key = request.args.get('header_key', '').strip()
+    if header_key:
+        header_value = request.args.get('header_value', '').strip()
+        field = f'headers__{header_key.lower().replace("-", "_")}'
+        if header_value:
+            q = q.filter(**{field + '__icontains': header_value})
+        else:
+            q = q.filter(**{field + '__exists': True})
+
+    # تاریخ‌ها
+    created_after = parse_date(request.args.get('created_after', ''))
+    if created_after:
+        q = q.filter(created_date__gte=created_after)
+    created_before = parse_date(request.args.get('created_before', ''))
+    if created_before:
+        q = q.filter(created_date__lte=created_before)
+
+    updated_after = parse_date(request.args.get('updated_after', ''))
+    if updated_after:
+        q = q.filter(last_update__gte=updated_after)
+    updated_before = parse_date(request.args.get('updated_before', ''))
+    if updated_before:
+        q = q.filter(last_update__lte=updated_before)
+
+    if request.args.get('only_new', '').lower() == 'true':
+        q = q.filter(created_date__gte=datetime.now() - timedelta(hours=24))
+
+    if request.args.get('only_changed', '').lower() == 'true':
+        q = q.filter(last_update__gte=datetime.now() - timedelta(hours=24))
+
+    sort_map = {
+        'created_date': '+created_date', '-created_date': '-created_date',
+        'last_update': '+last_update', '-last_update': '-last_update',
+        'status_code': '+status_code', '-status_code': '-status_code',
+        'title': '+title', '-title': '-title',
+    }
+    order = sort_map.get(request.args.get('sort', '-created_date'), '-created_date')
+    q = q.order_by(order)
+
+    total = q.count()
+    http_objs = list(q.skip((page - 1) * per_page).limit(per_page))
+    subdomains = [h.subdomain for h in http_objs]
+    provider_docs = Subdomains.objects(subdomain__in=subdomains).only('subdomain', 'providers')
+    provider_map = {sd.subdomain: sd.providers for sd in provider_docs}
+
+    return jsonify({
+        'total': total,
+        'page': page,
+        'per_page': per_page,
+        'pages': (total + per_page - 1) // per_page,
+        'data': [serialize_http(h, provider_map.get(h.subdomain, [])) for h in http_objs]
+    })
+
+
+# ==========================================
+# Assets — Combined/Joined View
+# ==========================================
+
+@app.route('/api/assets', methods=['GET'])
+@require_auth
+def get_assets():
+    """
+    دیدگاه ترکیبی: ساب‌دامین + وضعیت live + وضعیت HTTP در یک جواب.
+    مناسب برای صفحه اصلی داشبورد.
+
+    Query Params:
+      - program        : فیلتر برنامه
+      - scope          : فیلتر scope
+      - search         : جستجو در subdomain
+      - status         : all / live_only / http_only / both / none
+      - provider       : پروایدر خاص
+      - page, per_page
+    """
+    page, per_page = get_pagination_args()
+
+    program = request.args.get('program', '').strip()
+    scope = request.args.get('scope', '').strip()
+    search = request.args.get('search', '').strip()
+    status_filter = request.args.get('status', 'all').lower()
+    provider = request.args.get('provider', '').strip()
+
+    q = Subdomains.objects()
+    if program:
+        q = q.filter(program_name=program)
+    if scope:
+        q = q.filter(scope=scope)
+    if search:
+        q = q.filter(subdomain__icontains=search)
+    if provider:
+        q = q.filter(providers=provider)
+
+    total = q.count()
+    subs = q.skip((page - 1) * per_page).limit(per_page)
+
+    # ایجاد map سریع برای live و http
+    sub_names = [s.subdomain for s in subs]
+    live_map = {l.subdomain: l for l in LiveSubdomains.objects(subdomain__in=sub_names)}
+    http_map = {h.subdomain: h for h in Http.objects(subdomain__in=sub_names)}
+
+    results = []
+    for sd in Subdomains.objects(subdomain__in=sub_names).order_by('-created_date'):
+        live_obj = live_map.get(sd.subdomain)
+        http_obj = http_map.get(sd.subdomain)
+
+        asset_status = 'none'
+        if live_obj and http_obj:
+            asset_status = 'both'
+        elif live_obj:
+            asset_status = 'live_only'
+        elif http_obj:
+            asset_status = 'http_only'
+
+        if status_filter != 'all' and asset_status != status_filter:
+            continue
+
+        entry = {
+            'subdomain': sd.subdomain,
+            'program_name': sd.program_name,
+            'scope': sd.scope,
+            'providers': sd.providers,
+            'status': asset_status,
+            'created_date': sd.created_date.strftime('%Y-%m-%d %H:%M:%S') if sd.created_date else None,
         }
-    return jsonify(res)
+        if live_obj:
+            entry['live'] = {
+                'ips': live_obj.ips,
+                'cdn': live_obj.cdn,
+                'last_update': live_obj.last_update.strftime('%Y-%m-%d %H:%M:%S') if live_obj.last_update else None,
+            }
+        if http_obj:
+            entry['http'] = {
+                'url': http_obj.url,
+                'title': http_obj.title,
+                'status_code': http_obj.status_code,
+                'tech': http_obj.tech,
+                'favicon': http_obj.favicon,
+                'last_update': http_obj.last_update.strftime('%Y-%m-%d %H:%M:%S') if http_obj.last_update else None,
+            }
+        results.append(entry)
 
-
-@app.route('/api/subdomains/all')
-@require_auth
-def all_subdomains():
-    """دریافت کل ساب‌دامین‌های کشف شده در دیتابیس به صورت صفحه‌بندی شده"""
-    page, per_page = get_pagination_args()
-    total = Subdomains.objects().count()
-    subdomains = Subdomains.objects().skip((page - 1) * per_page).limit(per_page)
-    
     return jsonify({
         'total': total,
         'page': page,
         'per_page': per_page,
-        'data': [sd.subdomain for sd in subdomains]
+        'pages': (total + per_page - 1) // per_page,
+        'data': results
     })
 
 
-@app.route('/api/subdomains/<domain>')
+# ==========================================
+# Stats & Aggregations
+# ==========================================
+
+@app.route('/api/stats', methods=['GET'])
 @require_auth
-def subdomains_of_domain(domain):
+def global_stats():
+    """آمار کلی سیستم"""
+    return jsonify({
+        'programs': Programs.objects().count(),
+        'subdomains': Subdomains.objects().count(),
+        'live': LiveSubdomains.objects().count(),
+        'http': Http.objects().count(),
+        'new_subdomains_24h': Subdomains.objects(
+            created_date__gte=datetime.now() - timedelta(hours=24)).count(),
+        'new_live_24h': LiveSubdomains.objects(
+            created_date__gte=datetime.now() - timedelta(hours=24)).count(),
+        'new_http_24h': Http.objects(
+            created_date__gte=datetime.now() - timedelta(hours=24)).count(),
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+
+@app.route('/api/stats/program/<program_name>', methods=['GET'])
+@require_auth
+def program_stats(program_name):
+    """آمار دقیق یک برنامه"""
+    program = Programs.objects(program_name=program_name).first()
+    if not program:
+        return jsonify({'error': 'Program not found'}), 404
+
+    # توزیع status code
+    http_objs = Http.objects(program_name=program_name)
+    status_dist = {}
+    for h in http_objs:
+        key = str(h.status_code)
+        status_dist[key] = status_dist.get(key, 0) + 1
+
+    # توزیع CDN
+    live_objs = LiveSubdomains.objects(program_name=program_name)
+    cdn_dist = {}
+    for l in live_objs:
+        cdn = l.cdn or 'none'
+        cdn_dist[cdn] = cdn_dist.get(cdn, 0) + 1
+
+    # توزیع provider
+    subs = Subdomains.objects(program_name=program_name)
+    provider_dist = {}
+    for s in subs:
+        for p in s.providers:
+            provider_dist[p] = provider_dist.get(p, 0) + 1
+
+    # توزیع tech
+    tech_dist = {}
+    for h in http_objs:
+        for t in h.tech:
+            tech_dist[t] = tech_dist.get(t, 0) + 1
+
+    # top 10 تکنولوژی
+    top_techs = sorted(tech_dist.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return jsonify({
+        'program_name': program_name,
+        'totals': {
+            'subdomains': subs.count(),
+            'live': live_objs.count(),
+            'http': http_objs.count(),
+        },
+        'new_24h': {
+            'subdomains': Subdomains.objects(
+                program_name=program_name,
+                created_date__gte=datetime.now() - timedelta(hours=24)).count(),
+            'live': LiveSubdomains.objects(
+                program_name=program_name,
+                created_date__gte=datetime.now() - timedelta(hours=24)).count(),
+            'http': Http.objects(
+                program_name=program_name,
+                created_date__gte=datetime.now() - timedelta(hours=24)).count(),
+        },
+        'distributions': {
+            'status_codes': status_dist,
+            'cdn': cdn_dist,
+            'providers': provider_dist,
+            'top_techs': dict(top_techs),
+        }
+    })
+
+
+@app.route('/api/stats/timeline', methods=['GET'])
+@require_auth
+def timeline_stats():
     """
-    نمایش ساب‌دامین‌های یک دامین خاص.
-    🤖 هوشمند: تشخیص خودکار مرورگر برای نمایش خط‌به‌خط و بدون جیسون!
+    آمار روزانه کشف دارایی‌ها در ۳۰ روز گذشته.
+    Params:
+      - program : اختیاری — محدود به یک برنامه
+      - days    : تعداد روز (پیشفرض: 30)
     """
-    if not validate_domain(domain):
-        return jsonify({'error': 'Invalid domain format'}), 400
-    
-    page, per_page = get_pagination_args()
-    
-    subdomains_query = Subdomains.objects(scope=domain)
-    total = subdomains_query.count()
-    sub_objs = subdomains_query.skip((page - 1) * per_page).limit(per_page)
-    sub_list = [sd.subdomain for sd in sub_objs]
-    
-    # 🕵️‍♂️ تشخیص هوشمند نوع درخواست دهنده (مرورگر یا ابزار کلاینت)
-    user_agent = request.headers.get('User-Agent', '').lower()
-    is_browser = any(b in user_agent for b in ['mozilla', 'chrome', 'safari', 'edge', 'gecko'])
-    
-    # اگر کاربر عمداً پارامتر جیسون نخواسته باشه و با مرورگر اومده باشه
-    if is_browser and request.args.get('format', '').lower() != 'json':
-        # خروجی کاملاً متنی، تمیز و خط‌به‌خط برای راحتی شما در مرورگر
-        text_output = "\n".join(sub_list)
-        return app.response_class(text_output, mimetype='text/plain')
-    
-    # خروجی پیش‌فرض JSON فقط برای ابزار Go یا درخواست‌های خاص
-    return jsonify({
-        'total': total,
-        'page': page,
-        'per_page': per_page,
-        'data': sub_list
-    })
+    program = request.args.get('program', '').strip()
+    days = request.args.get('days', 30, type=int)
+    days = min(days, 90)
 
-@app.route('/api/lives/all')
+    timeline = []
+    for i in range(days - 1, -1, -1):
+        day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=i)
+        day_end = day_start + timedelta(days=1)
+
+        filters = {'created_date__gte': day_start, 'created_date__lt': day_end}
+        if program:
+            filters['program_name'] = program
+
+        timeline.append({
+            'date': day_start.strftime('%Y-%m-%d'),
+            'subdomains': Subdomains.objects(**filters).count(),
+            'live': LiveSubdomains.objects(**filters).count(),
+            'http': Http.objects(**filters).count(),
+        })
+
+    return jsonify({'days': days, 'program': program or 'all', 'data': timeline})
+
+
+# ==========================================
+# Lookup & Meta — برای populate کردن فیلترها در UI
+# ==========================================
+
+@app.route('/api/meta/providers', methods=['GET'])
 @require_auth
-def all_lives():
-    """لیست کل دارایی‌های دارای پاسخ زنده (Alive)"""
-    page, per_page = get_pagination_args()
-    total = LiveSubdomains.objects().count()
-    lives = LiveSubdomains.objects().skip((page - 1) * per_page).limit(per_page)
-    
-    return jsonify({
-        'total': total,
-        'page': page,
-        'per_page': per_page,
-        'data': [l.subdomain for l in lives]
-    })
+def get_providers():
+    """لیست تمام providerهای شناخته شده (برای dropdown فیلتر)"""
+    program = request.args.get('program', '').strip()
+    q = Subdomains.objects()
+    if program:
+        q = q.filter(program_name=program)
+    all_providers = set()
+    for sub in q.only('providers'):
+        all_providers.update(sub.providers)
+    return jsonify(sorted(all_providers))
 
 
-@app.route('/api/live/fresh')
+@app.route('/api/meta/techs', methods=['GET'])
 @require_auth
-def live_fresh():
-    """ساب‌دامین‌های جدیدی که در ۱۲ ساعت گذشته زنده شده‌اند"""
-    twelve_hours_ago = datetime.now() - timedelta(hours=12)
-    fresh_live = LiveSubdomains.objects(created_date__gte=twelve_hours_ago)
-    
-    return jsonify({
-        'total': fresh_live.count(),
-        'data': [l.subdomain for l in fresh_live]
-    })
+def get_techs():
+    """لیست تمام تکنولوژی‌های شناسایی شده (برای dropdown فیلتر)"""
+    program = request.args.get('program', '').strip()
+    q = Http.objects()
+    if program:
+        q = q.filter(program_name=program)
+    tech_count = {}
+    for h in q.only('tech'):
+        for t in h.tech:
+            tech_count[t] = tech_count.get(t, 0) + 1
+    sorted_techs = sorted(tech_count.items(), key=lambda x: x[1], reverse=True)
+    return jsonify([{'name': t, 'count': c} for t, c in sorted_techs])
 
 
-@app.route('/api/http/all')
+@app.route('/api/meta/cdns', methods=['GET'])
 @require_auth
-def all_http():
-    """دریافت وب‌سرویس‌های معتبر کشف شده (HTTP/HTTPS) در ۱۲ ساعت گذشته"""
-    page, per_page = get_pagination_args()
-    twelve_hours_ago = datetime.now() - timedelta(hours=12)
-    
-    total = Http.objects(last_update__gte=twelve_hours_ago).count()
-    http_objs = Http.objects(last_update__gte=twelve_hours_ago).skip((page - 1) * per_page).limit(per_page)
-    
-    return jsonify({
-        'total': total,
-        'page': page,
-        'per_page': per_page,
-        'data': [h.url for h in http_objs]
-    })
+def get_cdns():
+    """لیست CDNهای شناسایی شده"""
+    program = request.args.get('program', '').strip()
+    q = LiveSubdomains.objects(cdn__ne='')
+    if program:
+        q = q.filter(program_name=program)
+    cdn_count = {}
+    for l in q.only('cdn'):
+        if l.cdn:
+            cdn_count[l.cdn] = cdn_count.get(l.cdn, 0) + 1
+    return jsonify([{'name': c, 'count': n} for c, n in sorted(cdn_count.items(), key=lambda x: x[1], reverse=True)])
 
 
-@app.route('/api/http/fresh')
+@app.route('/api/meta/scopes', methods=['GET'])
 @require_auth
-def all_http_fresh():
-    """وب‌سرویس‌های کاملاً جدید اسکن شده در بازه ۱۲ ساعته اخیر"""
-    twelve_hours_ago = datetime.now() - timedelta(hours=12)
-    fresh_http = Http.objects(created_date__gte=twelve_hours_ago)
-    
+def get_scopes():
+    """لیست scopes برای فیلتر"""
+    program = request.args.get('program', '').strip()
+    if program:
+        p = Programs.objects(program_name=program).first()
+        return jsonify(p.scopes if p else [])
+    all_scopes = set()
+    for p in Programs.objects().only('scopes'):
+        all_scopes.update(p.scopes)
+    return jsonify(sorted(all_scopes))
+
+
+@app.route('/api/meta/ips', methods=['GET'])
+@require_auth
+def get_ips():
+    """لیست IP‌های منحصربه‌فرد (با فیلتر برنامه)"""
+    program = request.args.get('program', '').strip()
+    q = Http.objects()
+    if program:
+        q = q.filter(program_name=program)
+    all_ips = set()
+    for h in q.only('ips'):
+        all_ips.update(h.ips)
+    return jsonify(sorted(all_ips))
+
+
+# ==========================================
+# Search — جستجوی سراسری
+# ==========================================
+
+@app.route('/api/search', methods=['GET'])
+@require_auth
+def global_search():
+    """
+    جستجوی سراسری در تمام جداول.
+    Params:
+      - q       : رشته جستجو (الزامی، حداقل ۳ کاراکتر)
+      - program : محدود کردن به برنامه خاص
+      - limit   : حداکثر تعداد نتیجه از هر دسته (پیشفرض: 10)
+    """
+    query = request.args.get('q', '').strip()
+    program = request.args.get('program', '').strip()
+    limit = min(request.args.get('limit', 10, type=int), 50)
+
+    if len(query) < 3:
+        return jsonify({'error': 'Query must be at least 3 characters'}), 400
+
+    base_filter = {}
+    if program:
+        base_filter['program_name'] = program
+
+    subs = Subdomains.objects(subdomain__icontains=query, **base_filter).limit(limit)
+    lives = LiveSubdomains.objects(subdomain__icontains=query, **base_filter).limit(limit)
+    https = Http.objects(
+        Q(subdomain__icontains=query) | Q(url__icontains=query) | Q(title__icontains=query),
+        **base_filter
+    ).limit(limit)
+
     return jsonify({
-        'total': fresh_http.count(),
-        'data': [h.url for h in fresh_http]
+        'query': query,
+        'results': {
+            'subdomains': [serialize_subdomain(s) for s in subs],
+            'live': [serialize_live(l) for l in lives],
+            'http': [serialize_http(h) for h in https],
+        }
     })
 
+
+# ==========================================
+# Export
+# ==========================================
+
+@app.route('/api/export/subdomains', methods=['GET'])
+@require_auth
+def export_subdomains():
+    """
+    خروجی plain text از ساب‌دامین‌ها (یک خط یک دامنه).
+    همان فیلترهای /api/subdomains را می‌پذیرد.
+    مناسب برای pipe کردن مستقیم به ابزارهای ریکان.
+    """
+    q = Subdomains.objects()
+    program = request.args.get('program', '').strip()
+    scope = request.args.get('scope', '').strip()
+    provider = request.args.get('provider', '').strip()
+    has_http = request.args.get('has_http', '').lower()
+    has_live = request.args.get('has_live', '').lower()
+
+    if program:
+        q = q.filter(program_name=program)
+    if scope:
+        q = q.filter(scope=scope)
+    if provider:
+        q = q.filter(providers=provider)
+
+    if has_live in ('true', 'false'):
+        live_subs = set(LiveSubdomains.objects().distinct('subdomain'))
+        q = q.filter(subdomain__in=live_subs) if has_live == 'true' else q.filter(subdomain__nin=live_subs)
+
+    if has_http in ('true', 'false'):
+        http_subs = set(Http.objects().distinct('subdomain'))
+        q = q.filter(subdomain__in=http_subs) if has_http == 'true' else q.filter(subdomain__nin=http_subs)
+
+    text = '\n'.join(sd.subdomain for sd in q)
+    return app.response_class(text, mimetype='text/plain')
+
+
+@app.route('/api/export/urls', methods=['GET'])
+@require_auth
+def export_urls():
+    """خروجی plain text از URLها — مستقیم برای ابزارها"""
+    q = Http.objects()
+    program = request.args.get('program', '').strip()
+    scope = request.args.get('scope', '').strip()
+    status_code = request.args.get('status_code', type=int)
+
+    if program:
+        q = q.filter(program_name=program)
+    if scope:
+        q = q.filter(scope=scope)
+    if status_code:
+        q = q.filter(status_code=status_code)
+
+    urls = [h.url or h.subdomain for h in q if h.url or h.subdomain]
+    return app.response_class('\n'.join(urls), mimetype='text/plain')
+
+
+# ==========================================
+# Entry Point
+# ==========================================
 
 if __name__ == '__main__':
-    def handler(signal_received, frame):
-        # این تابع هنگام فشردن Ctrl+C اجرا می‌شود
+    def handler(sig, frame):
         print('\n[!] Shutting down Watchtower API cleanly...')
         sys.exit(0)
 
-    # ثبت سیگنال Ctrl+C در سیستم‌عامل
     signal.signal(signal.SIGINT, handler)
-
-    # اجرای وب‌سرور
     app.run(host='127.0.0.1', port=3131, debug=False)
