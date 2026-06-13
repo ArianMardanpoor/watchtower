@@ -486,11 +486,38 @@ def get_http():
     if ip:
         q = q.filter(ips=ip)
 
-    # فیلتر provider
+    # فیلتر provider (case-insensitive)
     provider = request.args.get('provider', '').strip()
     if provider:
-        http_subdomains = set(Subdomains.objects(providers=provider).distinct('subdomain'))
-        q = q.filter(subdomain__in=http_subdomains)
+        # جستجوی case-insensitive برای provider
+        provider_lower = provider.lower()
+        subdomains_with_provider = []
+        for sd in Subdomains.objects().only('subdomain', 'providers'):
+            if sd.providers and any(p.lower() == provider_lower for p in sd.providers):
+                subdomains_with_provider.append(sd.subdomain)
+        if subdomains_with_provider:
+            q = q.filter(subdomain__in=subdomains_with_provider)
+        else:
+            # اگر هیچ subdomain پیدا نشد، نتیجه خالی کن
+            q = q.filter(subdomain='__NO_MATCH__')
+
+    # فیلتر: فقط آن‌هایی که توسط یک پروایدر یافت شده‌اند
+    only_single_provider = request.args.get('only_single_provider', '').lower()
+    if only_single_provider == 'true':
+        # اگر provider مشخص شده باشد، محدود به همان provider که تنها یافته باشد
+        if provider:
+            docs = Subdomains.objects(providers=provider).only('subdomain', 'providers')
+            single_subs = {sd.subdomain for sd in docs if sd.providers and len(sd.providers) == 1}
+        else:
+            docs = Subdomains.objects().only('subdomain', 'providers')
+            single_subs = {sd.subdomain for sd in docs if sd.providers and len(sd.providers) == 1}
+
+        # اگر هیچ subdomain ای پیدا نشد، نتیجه باید خالی باشد
+        if single_subs:
+            q = q.filter(subdomain__in=single_subs)
+        else:
+            # Force empty query by filtering on impossible value
+            q = q.filter(subdomain='__NO_MATCH__')
 
     # فیلتر favicon
     has_favicon = request.args.get('has_favicon', '').lower()

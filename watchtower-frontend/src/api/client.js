@@ -1,9 +1,8 @@
 import axios from 'axios';
 
-// In development use relative /api so Vite proxy can forward requests to backend (avoids CORS).
-const API_URL = import.meta.env.DEV
-  ? '/api'
-  : import.meta.env.VITE_API_URL || 'http://localhost:3131/api';
+// تنظیم متغیرهای محیطی با ساختار تمیزتر
+const isDev = import.meta.env.DEV;
+const API_URL = isDev ? '/api' : (import.meta.env.VITE_API_URL || 'http://localhost:3131/api');
 const API_TOKEN = import.meta.env.VITE_API_TOKEN || 'a21uc0lzeTcK';
 
 export const apiClient = axios.create({
@@ -14,18 +13,41 @@ export const apiClient = axios.create({
   },
 });
 
-// اینترسپتور برای استخراج مستقیم دیتا و لاگ کردن خطاها
+// اینترسپتور هوشمندتر برای مدیریت خطاها و فایل‌ها
 apiClient.interceptors.response.use(
-  (response) => response.data,
+  (response) => {
+    // اگه درخواست از نوع دانلود فایل (blob) بود، کل ریسپانس رو برگردون تا هدرها رو از دست ندیم
+    if (response.config.responseType === 'blob') {
+      return response;
+    }
+    // برای بقیه درخواست‌ها، مستقیم دیتا رو بده
+    return response.data;
+  },
   (error) => {
-    console.error('API Error:', error.response?.data || error.message);
+    // استخراج اطلاعات خطا برای لاگ تمیزتر
+    const status = error.response?.status;
+    const message = error.response?.data?.message || error.message;
+
+    // اینجا می‌تونی ارورها رو گلوبال هندل کنی (مثلا ارور ۴۰۱ رو بفرستی صفحه لاگین)
+    if (status === 401) {
+      console.error('⚠️ خطای احراز هویت: توکن نامعتبر است!');
+    } else {
+      console.error(`❌ API Error [${status || 'Network'}]:`, message);
+    }
+    
     return Promise.reject(error);
   }
 );
 
-export async function downloadExport(path, params = {}) {
-  return await apiClient.get(path, {
-    params,
+// متد دانلود فایل (بدون نیاز به async/await اضافه)
+export const downloadExport = (path, params = {}) => {
+  // فیلتر پارامترهای خالی
+  const cleanParams = Object.entries(params)
+    .filter(([_, value]) => value !== '' && value !== undefined && value !== null)
+    .reduce((acc, [key, value]) => ({ ...acc, [key]: value }), {});
+  
+  return apiClient.get(path, {
+    params: cleanParams,
     responseType: 'blob',
-  });
-}
+  }).then(response => response.data);
+};

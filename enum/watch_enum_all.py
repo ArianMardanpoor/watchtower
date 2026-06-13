@@ -4,47 +4,52 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from database.db import Programs, current_time
-import config # فرض بر اینه که مسیرها اینجاست
 
-# مسیر دایرکتوری جاری رو داینامیک می‌گیریم
 ENUM_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def run_module(command):
     try:
         print(f"[{current_time()}] Starting: {' '.join(command)}")
-        # افزودن تایم‌اوت ۵ دقیقه‌ای (۳۰۰ ثانیه) برای هر ابزار
-        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
-        
+        # تایم‌اوت ۱۰ دقیقه‌ای برای ماژول‌های سنگین‌تر مثل GitHub یا Wayback
+        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             print(f"[{current_time()}] Error in {' '.join(command)}:\n{result.stderr}")
-            
     except subprocess.TimeoutExpired:
-        print(f"[{current_time()}] [!] Execution timed out for: {' '.join(command)}. Skipping...")
+        print(f"[{current_time()}] [!] Timeout for: {' '.join(command)}")
     except Exception as e:
-        print(f"[{current_time()}] Exception running module: {e}")
+        print(f"[{current_time()}] Exception: {e}")
 
 if __name__ == "__main__":
     programs = Programs.objects.all()
-
-    # ایجاد یک استخر از Threadها برای اجرای همزمان اسکریپت‌ها
     commands_to_run = []
 
     for p in programs:
-        print(f"[{current_time()}] Preparing tasks for program: {p.program_name}")
-        
         for scope in p.scopes:
-            # لیست دستوراتی که باید اجرا بشن (اسم فایل‌ها رو تصحیح کردم)
-            commands_to_run.extend([
-                ["python3", os.path.join(ENUM_DIR, "watch_crtsh.py"), scope],
-                ["python3", os.path.join(ENUM_DIR, "watch_subfinder.py"), scope],
-                ["python3", os.path.join(ENUM_DIR, "watch_abuseipdb.py"), scope],
-                # در آینده waybackurls هم اضافه میشه
-            ])
+            # لیست ماژول‌های فعال
+            modules = [
+                "watch_subfinder.py",
+                "watch_crtsh.py",
+                "watch_amass.py",
+                "watch_assetfinder.py",
+                "watch_chaos.py",
+                "watch_github.py",
+                "watch_waybackurls.py",
+                "watch_censys.py",
+                "watch_shodan.py"
+            ]
+            
+            for mod in modules:
+                commands_to_run.append(["python3", os.path.join(ENUM_DIR, mod), scope])
 
-    # اجرای همزمان (مثلاً ۳ ابزار/دامنه به طور همزمان اجرا میشن)
-    # می‌تونی max_workers رو بر اساس قدرت سرورت تنظیم کنی
-    print(f"[{current_time()}] Starting {len(commands_to_run)} background tasks...")
+    print(f"[{current_time()}] Starting {len(commands_to_run)} enumeration tasks...")
+    
+    # اجرای موازی ماژول‌ها
     with ThreadPoolExecutor(max_workers=5) as executor:
         executor.map(run_module, commands_to_run)
         
-    print(f"[{current_time()}] All enum operations completed!")
+    print(f"[{current_time()}] All enumeration modules finished. Starting DNS Resolution...")
+    
+    # اجرای نهایی رزولور
+    subprocess.run(["python3", os.path.join(ENUM_DIR, "watch_resolver.py")])
+    
+    print(f"[{current_time()}] Watchtower Recon Cycle Completed!")

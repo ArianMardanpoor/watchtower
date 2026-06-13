@@ -1,36 +1,47 @@
 import { useSearchParams } from 'react-router-dom';
 import { useCallback, useMemo } from 'react';
 
-export function useFilters(defaultFilters = { page: '1', per_page: '100' }) {
+export function useFilters(defaultFilters = {}) {
   const [searchParams, setSearchParams] = useSearchParams();
 
-  // استخراج فیلترهای فعلی از URL
+  // تبدیل searchParams به یک آبجکت ساده (استفاده از JSON.stringify برای جلوگیری از رندرهای اضافی)
+  const searchParamsString = searchParams.toString();
+
   const filters = useMemo(() => {
     const currentFilters = { ...defaultFilters };
     for (const [key, value] of searchParams.entries()) {
       currentFilters[key] = value;
     }
     return currentFilters;
-  }, [searchParams, defaultFilters]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParamsString]); 
 
-  // ثبت یا به‌روزرسانی یک فیلتر خاص
-  const setFilter = useCallback((key, value) => {
+  // ثبت یا به‌روزرسانی یک یا چند فیلتر
+  const setFilter = useCallback((keyOrObj, value) => {
     setSearchParams((prev) => {
-      if (value === undefined || value === '' || value === null) {
-        prev.delete(key);
-      } else {
-        prev.set(key, value);
-      }
+      const isObject = typeof keyOrObj === 'object' && keyOrObj !== null;
+      const updates = isObject ? keyOrObj : { [keyOrObj]: value };
       
-      // اگر فیلتری غیر از صفحه تغییر کرد، به صفحه اول برگردیم
-      if (key !== 'page' && prev.has('page')) {
+      let pageShouldReset = false;
+
+      Object.entries(updates).forEach(([k, v]) => {
+        if (v === undefined || v === '' || v === null) {
+          prev.delete(k);
+        } else {
+          prev.set(k, String(v));
+        }
+        if (k !== 'page') pageShouldReset = true;
+      });
+      
+      // برگشت به صفحه اول اگر فیلتری غیر از صفحه تغییر کرد
+      if (pageShouldReset && prev.has('page')) {
         prev.set('page', '1');
       }
+      
       return prev;
     }, { replace: true });
   }, [setSearchParams]);
 
-  // پاک کردن تمام فیلترها
   const resetFilters = useCallback(() => {
     setSearchParams(new URLSearchParams(defaultFilters), { replace: true });
   }, [setSearchParams, defaultFilters]);

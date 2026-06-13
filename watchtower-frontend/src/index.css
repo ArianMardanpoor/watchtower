@@ -4,30 +4,64 @@
 
 @layer base {
   :root {
-    --background: #0d1117;
-    --foreground: #e6edf3;
+    /* تم دارک مدرن (مشابه GitHub Dark یا داشبوردهای سایبری) */
+    --color-background: #0d1117;
+    --color-surface: #161b22;
+    --color-border: #30363d;
+    
+    /* رنگ‌های متن */
+    --color-primary: #e6edf3;
+    --color-primary-muted: #8b949e;
+    
+    /* رنگ‌های اصلی (وضعیت‌ها) */
+    --color-accent: #58a6ff;
+    --color-accent-hover: #3182ce;
+    --color-success: #2ea043;
+    --color-warning: #d29922;
+    --color-danger: #f85149;
+
     color-scheme: dark;
   }
   
   body {
-    background-color: var(--background);
-    color: var(--foreground);
-    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: var(--color-background);
+    color: var(--color-primary);
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
-  /* استایل برای اسکرول‌بار مرورگر (Webkit) */
+  /* اسکرول‌بار شخصی‌سازی شده و بسیار زیبا */
   ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+    width: 6px;
+    height: 6px;
   }
   ::-webkit-scrollbar-track {
-    background: transparent;
+    background: var(--color-background);
   }
   ::-webkit-scrollbar-thumb {
-    background: #30363d;
-    border-radius: 4px;
+    background: var(--color-border);
+    border-radius: 10px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: #8b949e;
+    background: var(--color-primary-muted);
+  }
+}
+
+/* انیمیشن‌های نرم و ترانزیشن‌های کلی */
+@layer utilities {
+  .animate-in {
+    animation: fadeIn 0.4s ease-out forwards;
+  }
+  
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
   }
 }

@@ -1,5 +1,9 @@
 import { apiClient } from './client';
 
-export const getAssets = async (params) => {
-  return await apiClient.get('/assets', { params });
+const cleanParams = (params) => {
+  return Object.entries(params)
+    .filter(([_, value]) => value !== '' && value !== undefined && value !== null)
+    .reduce((acc, [key, value]) => ({ ...acc, [key]: value }), {});
 };
+
+export const getAssets = (params) => apiClient.get('/assets', { params: cleanParams(params) });

@@ -1,9 +1,10 @@
 import { apiClient } from './client';
 
-export const getPrograms = async (params) => {
-  return await apiClient.get('/programs', { params });
+const cleanParams = (params) => {
+  return Object.entries(params)
+    .filter(([_, value]) => value !== '' && value !== undefined && value !== null)
+    .reduce((acc, [key, value]) => ({ ...acc, [key]: value }), {});
 };
 
-export const getProgramDetails = async (programName) => {
-  return await apiClient.get(`/programs/${programName}`);
-};
+export const getPrograms = (params) => apiClient.get('/programs', { params: cleanParams(params) });
+export const getProgramDetails = (programName) => apiClient.get(`/programs/${programName}`);
